@@ -37,6 +37,12 @@ app.get('/api/misiones', async (req, res) => {
     res.json({ futuras: cache.futuras, pasadas: cache.pasadas });
 });
 
+// --- NUEVA PUERTA TRASERA LIGERA PARA EL VIGILANTE (CRON-JOB) ---
+app.get('/ping', (req, res) => {
+    res.send('El servidor de Novastra está despierto y operativo.');
+});
+// ----------------------------------------------------------------
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Servidor activado en puerto ${PORT}`);
