@@ -11,36 +11,21 @@ app.get('/api/misiones', async (req, res) => {
     const ahora = Date.now();
 
     if (ahora - cache.ultimaActualizacion > TIEMPO_CACHE) {
-        console.log("Descargando datos frescos...");
+        console.log("Descargando datos frescos de The Space Devs (Producción)...");
         try {
+            // Usamos SOLO la API de Producción oficial (la buena)
             const urlSDFuturas = 'https://ll.thespacedevs.com/2.2.0/launch/upcoming/?limit=30';
             const urlSDPasadas = 'https://ll.thespacedevs.com/2.2.0/launch/previous/?limit=30';
-            const urlSpaceX = 'https://api.spacexdata.com/v4/launches/upcoming';
 
-            const [resSDFuturas, resSDPasadas, resSpaceX] = await Promise.all([
-                fetch(urlSDFuturas), fetch(urlSDPasadas), fetch(urlSpaceX)
+            const [resSDFuturas, resSDPasadas] = await Promise.all([
+                fetch(urlSDFuturas), fetch(urlSDPasadas)
             ]);
 
             const datosSDFuturas = await resSDFuturas.json();
             const datosSDPasadas = await resSDPasadas.json();
-            const datosSpaceX = await resSpaceX.json();
 
-            const futurasSinSpaceX = datosSDFuturas.results.filter(m => !(m.launch_service_provider?.name || "").toLowerCase().includes("spacex"));
-            
-            const futurasSpaceXTraducidas = datosSpaceX.map(sx => ({
-                name: "SpaceX | " + sx.name,
-                net: sx.date_utc,
-                launch_service_provider: { name: "SpaceX" },
-                rocket: { configuration: { name: "Falcon / Starship" } },
-                pad: { location: { name: "Plataforma Oficial de SpaceX" } },
-                mission: { type: "Comercial / Starlink", description: sx.details },
-                vid_urls: sx.links.webcast ? [{ url: sx.links.webcast }] : [],
-                webcast_live: false,
-                image: sx.links.patch.large || 'https://images.unsplash.com/photo-1541185933-ef5d8ed016c2?q=80&w=1000&auto=format&fit=crop',
-                is_verified: true
-            }));
-
-            cache.futuras = [...futurasSinSpaceX, ...futurasSpaceXTraducidas].sort((a, b) => new Date(a.net) - new Date(b.net));
+            // Guardamos los datos reales y actualizados
+            cache.futuras = datosSDFuturas.results;
             cache.pasadas = datosSDPasadas.results;
             cache.ultimaActualizacion = ahora;
 
