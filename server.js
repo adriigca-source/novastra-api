@@ -4,46 +4,44 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 
+// Memoria temporal para no saturar la API externa
 let cache = { futuras: [], pasadas: [], ultimaActualizacion: 0 };
 const TIEMPO_CACHE = 5 * 60 * 1000; // 5 minutos
 
 app.get('/api/misiones', async (req, res) => {
     const ahora = Date.now();
 
+    // Solo pedimos datos nuevos si han pasado más de 5 minutos
     if (ahora - cache.ultimaActualizacion > TIEMPO_CACHE) {
-        console.log("Descargando datos frescos de The Space Devs (Producción)...");
+        console.log("Sincronizando con The Space Devs...");
         try {
-            // Usamos SOLO la API de Producción oficial (la buena)
-            const urlSDFuturas = 'https://ll.thespacedevs.com/2.2.0/launch/upcoming/?limit=30';
-            const urlSDPasadas = 'https://ll.thespacedevs.com/2.2.0/launch/previous/?limit=30';
-
-            const [resSDFuturas, resSDPasadas] = await Promise.all([
-                fetch(urlSDFuturas), fetch(urlSDPasadas)
+            const [resFuturas, resSDPasadas] = await Promise.all([
+                fetch('https://ll.thespacedevs.com/2.2.0/launch/upcoming/?limit=20'),
+                fetch('https://ll.thespacedevs.com/2.2.0/launch/previous/?limit=20')
             ]);
 
-            const datosSDFuturas = await resSDFuturas.json();
-            const datosSDPasadas = await resSDPasadas.json();
+            const datosF = await resFuturas.json();
+            const datosP = await resSDPasadas.json();
 
-            // Guardamos los datos reales y actualizados
-            cache.futuras = datosSDFuturas.results;
-            cache.pasadas = datosSDPasadas.results;
-            cache.ultimaActualizacion = ahora;
-
+            cache = { 
+                futuras: datosF.results || [], 
+                pasadas: datosP.results || [], 
+                ultimaActualizacion: ahora 
+            };
         } catch (error) {
-            console.error("Error actualizando la base de datos:", error);
+            console.error("Error en la conexión con la API:", error);
         }
     }
 
     res.json({ futuras: cache.futuras, pasadas: cache.pasadas });
 });
 
-// --- NUEVA PUERTA TRASERA LIGERA PARA EL VIGILANTE (CRON-JOB) ---
+// Puerta trasera para el robot de cron-job.org
 app.get('/ping', (req, res) => {
-    res.send('El servidor de Novastra está despierto y operativo.');
+    res.send('Novastra OK');
 });
-// ----------------------------------------------------------------
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`Servidor activado en puerto ${PORT}`);
+    console.log(`Servidor Novastra activo en puerto ${PORT}`);
 });
