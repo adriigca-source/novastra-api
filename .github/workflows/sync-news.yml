@@ -1,0 +1,15 @@
+name: Sync Noticias Novastra
+
+on:
+  schedule:
+    - cron: "30 3 * * *" # cada dia 03:30 UTC
+  workflow_dispatch:
+
+jobs:
+  sync-news:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Llamar sync de noticias
+        run: |
+          curl --retry 5 --retry-delay 20 --retry-all-errors --fail-with-body \
+          "https://novastra-api.onrender.com/api/sync-news?secret=${{ secrets.SYNC_SECRET }}"
