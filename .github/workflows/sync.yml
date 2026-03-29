@@ -1,0 +1,14 @@
+name: Sync Novastra
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Llamar a la sincronizacion
+        run: curl -fsSL "${{ secrets.NOVASTRA_SYNC_URL }}"
