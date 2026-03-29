@@ -16,6 +16,8 @@ const UPCOMING_LIMIT = 60;
 const RECENT_PAST_LIMIT = 30;
 const IMPORT_PAGE_SIZE = 100;
 const HISTORY_PAGE_LIMIT_MAX = 100;
+const NEWS_LIMIT = 40;
+const NEWS_LOOKBACK_DAYS = 7;
 
 if (!uri) {
     throw new Error("Falta la variable de entorno MONGODB_URI");
@@ -35,6 +37,92 @@ function isAuthorized(req) {
 
     const providedSecret = req.headers["x-sync-secret"] || req.query.secret;
     return providedSecret === syncSecret;
+}
+
+function toIsoDate(value) {
+    const d = new Date(value);
+    return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+function stripHtml(text = "") {
+    return String(text).replace(/<[^>]*>/g, "").trim();
+}
+
+async function translateEnToEs(text) {
+    const clean = stripHtml(text);
+    if (!clean) return "";
+
+    try {
+        const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(clean)}&langpair=en|es`;
+        const res = await fetch(url);
+        if (!res.ok) return clean;
+        const data = await res.json();
+        const translated = data?.responseData?.translatedText;
+        return translated ? stripHtml(translated) : clean;
+    } catch {
+        return clean;
+    }
+}
+
+async function fetchRecentSpaceNews() {
+    const res = await fetch("https://api.spaceflightnewsapi.net/v4/articles/?limit=80&ordering=-published_at");
+    if (!res.ok) {
+        throw new Error("No se pudieron descargar noticias espaciales.");
+    }
+
+    const data = await res.json();
+    const results = Array.isArray(data.results) ? data.results : [];
+    const since = Date.now() - NEWS_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
+
+    const filtered = results
+        .filter((item) => {
+            const t = new Date(item.published_at || item.publishedAt || 0).getTime();
+            return Number.isFinite(t) && t >= since;
+        })
+        .filter((item) => item.url)
+        .slice(0, NEWS_LIMIT * 2);
+
+    const seen = new Set();
+    const dedup = [];
+    for (const item of filtered) {
+        if (seen.has(item.url)) continue;
+        seen.add(item.url);
+        dedup.push(item);
+        if (dedup.length >= NEWS_LIMIT) break;
+    }
+
+    const translated = [];
+    for (const item of dedup) {
+        const titleEs = await translateEnToEs(item.title || "");
+        const summaryEs = await translateEnToEs(item.summary || "");
+
+        translated.push({
+            tipo_documento: "noticia",
+            news_id: String(item.id || item.url),
+            url: item.url,
+            title: titleEs || item.title || "",
+            summary: summaryEs || item.summary || "",
+            image_url: item.image_url || item.imageUrl || "",
+            source: item.news_site || item.newsSite || "Fuente externa",
+            published_at: toIsoDate(item.published_at || item.publishedAt),
+            updated_at: new Date().toISOString()
+        });
+    }
+
+    return translated;
+}
+
+async function syncNewsToMongo() {
+    const collection = await getCollection();
+    const news = await fetchRecentSpaceNews();
+
+    await collection.deleteMany({ tipo_documento: "noticia" });
+
+    if (news.length > 0) {
+        await collection.insertMany(news);
+    }
+
+    return news.length;
 }
 
 function compactLaunch(launch, tipoDocumento = "historico") {
@@ -514,6 +602,49 @@ app.get("/api/estadisticas", async (req, res) => {
         console.error("Error en /api/estadisticas:", error);
         return res.status(500).json({
             error: "Error calculando estadisticas",
+            detalle: error.message
+        });
+    }
+});
+
+app.get("/api/sync-news", async (req, res) => {
+    if (!isAuthorized(req)) {
+        return res.status(401).json({ error: "No autorizado para sincronizar noticias." });
+    }
+
+    try {
+        const total = await syncNewsToMongo();
+        return res.json({
+            mensaje: "Noticias sincronizadas correctamente",
+            noticias_guardadas: total,
+            ventana_dias: NEWS_LOOKBACK_DAYS
+        });
+    } catch (error) {
+        console.error("Error en /api/sync-news:", error);
+        return res.status(500).json({
+            error: "Fallo sincronizando noticias",
+            detalle: error.message
+        });
+    }
+});
+
+app.get("/api/noticias", async (req, res) => {
+    try {
+        const collection = await getCollection();
+        const resultados = await collection
+            .find({ tipo_documento: "noticia" })
+            .sort({ published_at: -1 })
+            .limit(NEWS_LIMIT)
+            .toArray();
+
+        return res.json({
+            resultados,
+            total: resultados.length
+        });
+    } catch (error) {
+        console.error("Error en /api/noticias:", error);
+        return res.status(500).json({
+            error: "Error leyendo noticias",
             detalle: error.message
         });
     }
