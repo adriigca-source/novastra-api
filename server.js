@@ -1,5 +1,3 @@
-require("dotenv").config();
-
 const express = require("express");
 const cors = require("cors");
 const { MongoClient } = require("mongodb");
@@ -45,7 +43,7 @@ function compactLaunch(launch, tipoDocumento = "historico") {
         tipo_documento: tipoDocumento,
         name: launch.name || "",
         net: launch.net || null,
-        image: launch.image || launch.image_url || launch.rocket?.configuration?.image_url || "",
+        image: launch.image || launch.image_url || (launch.rocket && launch.rocket.configuration && launch.rocket.configuration.image_url) || "",
         status: launch.status
             ? {
                   id: launch.status.id || null,
@@ -217,7 +215,7 @@ async function syncMasterAndArchive() {
         return Number.isFinite(launchTime) && launchTime <= now;
     });
 
-    const allHistoric = [...data.pasadas, ...pastFromFuture];
+    const allHistoric = data.pasadas.concat(pastFromFuture);
     const compactHistoric = allHistoric.map((launch) => compactLaunch(launch, "historico"));
     const compactFuture = data.futuras
         .filter((launch) => {
@@ -326,15 +324,13 @@ app.get("/api/historial", async (req, res) => {
         const skip = (page - 1) * limit;
         const query = buildHistoricQuery(req.query);
 
-        const [total, resultados] = await Promise.all([
-            collection.countDocuments(query),
-            collection
-                .find(query)
-                .sort({ net: -1 })
-                .skip(skip)
-                .limit(limit)
-                .toArray()
-        ]);
+        const total = await collection.countDocuments(query);
+        const resultados = await collection
+            .find(query)
+            .sort({ net: -1 })
+            .skip(skip)
+            .limit(limit)
+            .toArray();
 
         return res.json({
             resultados,
