@@ -1,13 +1,14 @@
 {
   "name": "novastra-api",
   "version": "1.0.0",
-  "description": "Backend de Novastra",
+  "description": "API Backend para Novastra",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
+    "express": "^4.18.2",
     "cors": "^2.8.5",
-    "express": "^4.18.2"
+    "mongodb": "^6.5.0"
   }
 }
