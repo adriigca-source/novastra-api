@@ -16,6 +16,8 @@ const UPCOMING_LIMIT = 60;
 const RECENT_PAST_LIMIT = 30;
 const IMPORT_PAGE_SIZE = 100;
 const HISTORY_PAGE_LIMIT_MAX = 100;
+const FETCH_RETRIES = 3;
+const FETCH_DELAY_MS = 3500;
 
 if (!uri) {
     throw new Error("Falta la variable de entorno MONGODB_URI");
@@ -35,6 +37,34 @@ function isAuthorized(req) {
 
     const providedSecret = req.headers["x-sync-secret"] || req.query.secret;
     return providedSecret === syncSecret;
+}
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchJsonWithRetry(url, retries = FETCH_RETRIES) {
+    let lastError;
+
+    for (let attempt = 1; attempt <= retries; attempt += 1) {
+        try {
+            const response = await fetch(url);
+
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status} en ${url}`);
+            }
+
+            return await response.json();
+        } catch (error) {
+            lastError = error;
+
+            if (attempt < retries) {
+                await sleep(FETCH_DELAY_MS);
+            }
+        }
+    }
+
+    throw lastError;
 }
 
 function compactLaunch(launch, tipoDocumento = "historico") {
@@ -102,17 +132,10 @@ function sortByNetDesc(a, b) {
 }
 
 async function downloadLaunches() {
-    const [futureResponse, pastResponse] = await Promise.all([
-        fetch("https://ll.thespacedevs.com/2.2.0/launch/upcoming/?limit=100"),
-        fetch("https://ll.thespacedevs.com/2.2.0/launch/previous/?limit=100")
+    const [futureData, pastData] = await Promise.all([
+        fetchJsonWithRetry("https://ll.thespacedevs.com/2.2.0/launch/upcoming/?limit=100"),
+        fetchJsonWithRetry("https://ll.thespacedevs.com/2.2.0/launch/previous/?limit=100")
     ]);
-
-    if (!futureResponse.ok || !pastResponse.ok) {
-        throw new Error("No se pudieron descargar los lanzamientos desde The Space Devs.");
-    }
-
-    const futureData = await futureResponse.json();
-    const pastData = await pastResponse.json();
 
     return {
         futuras: Array.isArray(futureData.results) ? futureData.results : [],
@@ -121,15 +144,9 @@ async function downloadLaunches() {
 }
 
 async function downloadPastLaunchesPage(offset = 0, limit = IMPORT_PAGE_SIZE) {
-    const response = await fetch(
+    return fetchJsonWithRetry(
         `https://ll.thespacedevs.com/2.2.0/launch/previous/?limit=${limit}&offset=${offset}`
     );
-
-    if (!response.ok) {
-        throw new Error(`No se pudo descargar la pagina offset=${offset}`);
-    }
-
-    return response.json();
 }
 
 async function upsertHistoricLaunches(collection, launches) {
@@ -167,6 +184,7 @@ async function importPastLaunches(maxPages = 5, pageSize = IMPORT_PAGE_SIZE) {
         }
 
         totalImported += await upsertHistoricLaunches(collection, launches);
+        await sleep(1200);
     }
 
     return totalImported;
