@@ -16,8 +16,6 @@ const UPCOMING_LIMIT = 60;
 const RECENT_PAST_LIMIT = 30;
 const IMPORT_PAGE_SIZE = 100;
 const HISTORY_PAGE_LIMIT_MAX = 100;
-const FETCH_RETRIES = 3;
-const FETCH_DELAY_MS = 3500;
 
 if (!uri) {
     throw new Error("Falta la variable de entorno MONGODB_URI");
@@ -39,41 +37,13 @@ function isAuthorized(req) {
     return providedSecret === syncSecret;
 }
 
-function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function fetchJsonWithRetry(url, retries = FETCH_RETRIES) {
-    let lastError;
-
-    for (let attempt = 1; attempt <= retries; attempt += 1) {
-        try {
-            const response = await fetch(url);
-
-            if (!response.ok) {
-                throw new Error(`HTTP ${response.status} en ${url}`);
-            }
-
-            return await response.json();
-        } catch (error) {
-            lastError = error;
-
-            if (attempt < retries) {
-                await sleep(FETCH_DELAY_MS);
-            }
-        }
-    }
-
-    throw lastError;
-}
-
 function compactLaunch(launch, tipoDocumento = "historico") {
     return {
         launch_id: launch.id || launch.launch_id || "",
         tipo_documento: tipoDocumento,
         name: launch.name || "",
         net: launch.net || null,
-        image: launch.image || launch.image_url || (launch.rocket && launch.rocket.configuration && launch.rocket.configuration.image_url) || "",
+        image: launch.image || launch.image_url || launch.rocket?.configuration?.image_url || "",
         status: launch.status
             ? {
                   id: launch.status.id || null,
@@ -132,10 +102,17 @@ function sortByNetDesc(a, b) {
 }
 
 async function downloadLaunches() {
-    const [futureData, pastData] = await Promise.all([
-        fetchJsonWithRetry("https://ll.thespacedevs.com/2.2.0/launch/upcoming/?limit=100"),
-        fetchJsonWithRetry("https://ll.thespacedevs.com/2.2.0/launch/previous/?limit=100")
+    const [futureResponse, pastResponse] = await Promise.all([
+        fetch("https://ll.thespacedevs.com/2.2.0/launch/upcoming/?limit=100"),
+        fetch("https://ll.thespacedevs.com/2.2.0/launch/previous/?limit=100")
     ]);
+
+    if (!futureResponse.ok || !pastResponse.ok) {
+        throw new Error("No se pudieron descargar los lanzamientos desde The Space Devs.");
+    }
+
+    const futureData = await futureResponse.json();
+    const pastData = await pastResponse.json();
 
     return {
         futuras: Array.isArray(futureData.results) ? futureData.results : [],
@@ -144,9 +121,15 @@ async function downloadLaunches() {
 }
 
 async function downloadPastLaunchesPage(offset = 0, limit = IMPORT_PAGE_SIZE) {
-    return fetchJsonWithRetry(
+    const response = await fetch(
         `https://ll.thespacedevs.com/2.2.0/launch/previous/?limit=${limit}&offset=${offset}`
     );
+
+    if (!response.ok) {
+        throw new Error(`No se pudo descargar la pagina offset=${offset}`);
+    }
+
+    return response.json();
 }
 
 async function upsertHistoricLaunches(collection, launches) {
@@ -184,7 +167,6 @@ async function importPastLaunches(maxPages = 5, pageSize = IMPORT_PAGE_SIZE) {
         }
 
         totalImported += await upsertHistoricLaunches(collection, launches);
-        await sleep(1200);
     }
 
     return totalImported;
@@ -233,7 +215,7 @@ async function syncMasterAndArchive() {
         return Number.isFinite(launchTime) && launchTime <= now;
     });
 
-    const allHistoric = data.pasadas.concat(pastFromFuture);
+    const allHistoric = [...data.pasadas, ...pastFromFuture];
     const compactHistoric = allHistoric.map((launch) => compactLaunch(launch, "historico"));
     const compactFuture = data.futuras
         .filter((launch) => {
@@ -342,13 +324,15 @@ app.get("/api/historial", async (req, res) => {
         const skip = (page - 1) * limit;
         const query = buildHistoricQuery(req.query);
 
-        const total = await collection.countDocuments(query);
-        const resultados = await collection
-            .find(query)
-            .sort({ net: -1 })
-            .skip(skip)
-            .limit(limit)
-            .toArray();
+        const [total, resultados] = await Promise.all([
+            collection.countDocuments(query),
+            collection
+                .find(query)
+                .sort({ net: -1 })
+                .skip(skip)
+                .limit(limit)
+                .toArray()
+        ]);
 
         return res.json({
             resultados,
@@ -397,6 +381,139 @@ app.get("/api/buscar", async (req, res) => {
         console.error("Error en /api/buscar:", error);
         return res.status(500).json({
             error: "Error buscando en MongoDB",
+            detalle: error.message
+        });
+    }
+});
+
+app.get("/api/estadisticas", async (req, res) => {
+    try {
+        const collection = await getCollection();
+
+        const yearsPipeline = [
+            { $match: { tipo_documento: "historico" } },
+            {
+                $addFields: {
+                    parsedNet: {
+                        $dateFromString: {
+                            dateString: "$net",
+                            onError: null,
+                            onNull: null
+                        }
+                    }
+                }
+            },
+            { $match: { parsedNet: { $ne: null } } },
+            { $group: { _id: { $year: "$parsedNet" } } },
+            { $sort: { _id: -1 } }
+        ];
+
+        const yearsDocs = await collection.aggregate(yearsPipeline).toArray();
+        const years = yearsDocs.map((doc) => doc._id).filter((year) => Number.isFinite(year));
+        const latestYear = years.length > 0 ? years[0] : new Date().getFullYear();
+        const selectedYear = Number(req.query.year || latestYear);
+
+        const statsPipeline = [
+            { $match: { tipo_documento: "historico" } },
+            {
+                $addFields: {
+                    parsedNet: {
+                        $dateFromString: {
+                            dateString: "$net",
+                            onError: null,
+                            onNull: null
+                        }
+                    }
+                }
+            },
+            {
+                $match: {
+                    parsedNet: { $ne: null },
+                    $expr: { $eq: [{ $year: "$parsedNet" }, selectedYear] }
+                }
+            },
+            {
+                $facet: {
+                    monthly: [
+                        { $group: { _id: { $month: "$parsedNet" }, count: { $sum: 1 } } },
+                        { $sort: { _id: 1 } }
+                    ],
+                    agencies: [
+                        {
+                            $group: {
+                                _id: {
+                                    $ifNull: ["$launch_service_provider.name", "Desconocida"]
+                                },
+                                count: { $sum: 1 }
+                            }
+                        },
+                        { $sort: { count: -1 } },
+                        { $limit: 10 }
+                    ],
+                    statuses: [
+                        {
+                            $group: {
+                                _id: {
+                                    $toLower: {
+                                        $ifNull: ["$status.name", ""]
+                                    }
+                                },
+                                count: { $sum: 1 }
+                            }
+                        }
+                    ],
+                    totals: [{ $count: "total" }]
+                }
+            }
+        ];
+
+        const [statsDoc] = await collection.aggregate(statsPipeline).toArray();
+        const monthlyRaw = statsDoc?.monthly || [];
+        const agenciesRaw = statsDoc?.agencies || [];
+        const statusesRaw = statsDoc?.statuses || [];
+        const totalLaunches = statsDoc?.totals?.[0]?.total || 0;
+
+        const monthlyMap = new Map(monthlyRaw.map((item) => [item._id, item.count]));
+        const monthly = Array.from({ length: 12 }, (_, index) => {
+            const month = index + 1;
+            return {
+                month,
+                count: monthlyMap.get(month) || 0
+            };
+        });
+
+        let successCount = 0;
+        let failedCount = 0;
+
+        statusesRaw.forEach((item) => {
+            const key = String(item._id || "");
+            const count = Number(item.count || 0);
+            if (key.includes("success") || key.includes("exito")) {
+                successCount += count;
+            } else if (key.includes("fail") || key.includes("fall")) {
+                failedCount += count;
+            }
+        });
+
+        const byAgency = agenciesRaw.map((item) => ({
+            name: item._id || "Desconocida",
+            count: item.count,
+            percent: totalLaunches > 0 ? Math.round((item.count / totalLaunches) * 100) : 0
+        }));
+
+        return res.json({
+            year: selectedYear,
+            years,
+            total_launches: totalLaunches,
+            success_count: successCount,
+            failed_count: failedCount,
+            by_agency: byAgency,
+            by_month: monthly
+        });
+    } catch (error) {
+        console.error("Error en /api/estadisticas:", error);
+        return res.status(500).json({
+            error: "Error calculando estadisticas",
             detalle: error.message
         });
     }
