@@ -16,10 +16,8 @@ const UPCOMING_LIMIT = 60;
 const RECENT_PAST_LIMIT = 30;
 const IMPORT_PAGE_SIZE = 100;
 const HISTORY_PAGE_LIMIT_MAX = 100;
-
 const NEWS_LIMIT = 40;
 const NEWS_LOOKBACK_DAYS = 7;
-const NEWS_DAILY_HOURS = 24;
 
 if (!uri) {
     throw new Error("Falta la variable de entorno MONGODB_URI");
@@ -33,19 +31,17 @@ async function getCollection() {
 }
 
 function isAuthorized(req) {
-    if (!syncSecret) return true;
+    if (!syncSecret) {
+        return true;
+    }
+
     const providedSecret = req.headers["x-sync-secret"] || req.query.secret;
     return providedSecret === syncSecret;
 }
 
-function toTime(value) {
-    const t = new Date(value).getTime();
-    return Number.isFinite(t) ? t : null;
-}
-
 function toIsoDate(value) {
-    const t = toTime(value);
-    return t ? new Date(t).toISOString() : null;
+    const d = new Date(value);
+    return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
 function stripHtml(text = "") {
@@ -66,6 +62,67 @@ async function translateEnToEs(text) {
     } catch {
         return clean;
     }
+}
+
+async function fetchRecentSpaceNews() {
+    const res = await fetch("https://api.spaceflightnewsapi.net/v4/articles/?limit=80&ordering=-published_at");
+    if (!res.ok) {
+        throw new Error("No se pudieron descargar noticias espaciales.");
+    }
+
+    const data = await res.json();
+    const results = Array.isArray(data.results) ? data.results : [];
+    const since = Date.now() - NEWS_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
+
+    const filtered = results
+        .filter((item) => {
+            const t = new Date(item.published_at || item.publishedAt || 0).getTime();
+            return Number.isFinite(t) && t >= since;
+        })
+        .filter((item) => item.url)
+        .slice(0, NEWS_LIMIT * 2);
+
+    const seen = new Set();
+    const dedup = [];
+    for (const item of filtered) {
+        if (seen.has(item.url)) continue;
+        seen.add(item.url);
+        dedup.push(item);
+        if (dedup.length >= NEWS_LIMIT) break;
+    }
+
+    const translated = [];
+    for (const item of dedup) {
+        const titleEs = await translateEnToEs(item.title || "");
+        const summaryEs = await translateEnToEs(item.summary || "");
+
+        translated.push({
+            tipo_documento: "noticia",
+            news_id: String(item.id || item.url),
+            url: item.url,
+            title: titleEs || item.title || "",
+            summary: summaryEs || item.summary || "",
+            image_url: item.image_url || item.imageUrl || "",
+            source: item.news_site || item.newsSite || "Fuente externa",
+            published_at: toIsoDate(item.published_at || item.publishedAt),
+            updated_at: new Date().toISOString()
+        });
+    }
+
+    return translated;
+}
+
+async function syncNewsToMongo() {
+    const collection = await getCollection();
+    const news = await fetchRecentSpaceNews();
+
+    await collection.deleteMany({ tipo_documento: "noticia" });
+
+    if (news.length > 0) {
+        await collection.insertMany(news);
+    }
+
+    return news.length;
 }
 
 function compactLaunch(launch, tipoDocumento = "historico") {
@@ -168,13 +225,16 @@ async function upsertHistoricLaunches(collection, launches) {
 
     for (const launch of launches) {
         const compact = compactLaunch(launch, "historico");
-        if (!compact.launch_id) continue;
+        if (!compact.launch_id) {
+            continue;
+        }
 
         await collection.updateOne(
             { launch_id: compact.launch_id, tipo_documento: "historico" },
             { $set: compact },
             { upsert: true }
         );
+
         total += 1;
     }
 
@@ -183,18 +243,71 @@ async function upsertHistoricLaunches(collection, launches) {
 
 async function importPastLaunches(maxPages = 5, pageSize = IMPORT_PAGE_SIZE) {
     const collection = await getCollection();
-    let totalImported = 0;
+    const imported = await importPastLaunchesFromOffset(collection, 0, maxPages, pageSize);
+    return imported.registrosImportados;
+}
 
-    for (let page = 0; page < maxPages; page += 1) {
-        const offset = page * pageSize;
-        const data = await downloadPastLaunchesPage(offset, pageSize);
-        const launches = Array.isArray(data.results) ? data.results : [];
-
-        if (launches.length === 0) break;
-        totalImported += await upsertHistoricLaunches(collection, launches);
+async function getHistoricImportCursor(collection) {
+    const cursorDoc = await collection.findOne({ id_guardado: "historial_import_cursor" });
+    if (!cursorDoc || !Number.isFinite(Number(cursorDoc.offset_actual))) {
+        return 0;
     }
 
-    return totalImported;
+    return Math.max(0, Number(cursorDoc.offset_actual));
+}
+
+async function setHistoricImportCursor(collection, nextOffset) {
+    await collection.updateOne(
+        { id_guardado: "historial_import_cursor" },
+        {
+            $set: {
+                offset_actual: Math.max(0, Number(nextOffset || 0)),
+                fecha_actualizacion: new Date()
+            }
+        },
+        { upsert: true }
+    );
+}
+
+async function importPastLaunchesFromOffset(collection, startOffset = 0, maxPages = 5, pageSize = IMPORT_PAGE_SIZE) {
+    let totalImported = 0;
+    let pagesProcessed = 0;
+    let currentOffset = Math.max(0, Number(startOffset || 0));
+    let totalAvailable = null;
+    let exhausted = false;
+
+    for (let page = 0; page < maxPages; page += 1) {
+        const data = await downloadPastLaunchesPage(currentOffset, pageSize);
+        const launches = Array.isArray(data.results) ? data.results : [];
+
+        if (Number.isFinite(Number(data.count))) {
+            totalAvailable = Number(data.count);
+        }
+
+        if (launches.length === 0) {
+            exhausted = true;
+            break;
+        }
+
+        totalImported += await upsertHistoricLaunches(collection, launches);
+        pagesProcessed += 1;
+        currentOffset += pageSize;
+
+        if (totalAvailable !== null && currentOffset >= totalAvailable) {
+            exhausted = true;
+            break;
+        }
+    }
+
+    const hasMore = !exhausted && (totalAvailable === null || currentOffset < totalAvailable);
+
+    return {
+        registrosImportados: totalImported,
+        paginasProcesadas: pagesProcessed,
+        offsetSiguiente: currentOffset,
+        totalDisponible: totalAvailable,
+        quedanMas: hasMore
+    };
 }
 
 function buildHistoricQuery(reqQuery) {
@@ -215,9 +328,17 @@ function buildHistoricQuery(reqQuery) {
         ];
     }
 
-    if (agencia) query["launch_service_provider.name"] = agencia;
-    if (cohete) query["rocket.configuration.name"] = cohete;
-    if (mision) query["mission.type"] = mision;
+    if (agencia) {
+        query["launch_service_provider.name"] = agencia;
+    }
+
+    if (cohete) {
+        query["rocket.configuration.name"] = cohete;
+    }
+
+    if (mision) {
+        query["mission.type"] = mision;
+    }
 
     return query;
 }
@@ -234,7 +355,6 @@ async function syncMasterAndArchive() {
 
     const allHistoric = [...data.pasadas, ...pastFromFuture];
     const compactHistoric = allHistoric.map((launch) => compactLaunch(launch, "historico"));
-
     const compactFuture = data.futuras
         .filter((launch) => {
             const launchTime = new Date(launch.net || 0).getTime();
@@ -266,114 +386,6 @@ async function syncMasterAndArchive() {
     };
 }
 
-// -------------------- NOTICIAS --------------------
-
-function getNewsScope(publishedAtMs, nowMs) {
-    const diffMs = nowMs - publishedAtMs;
-    const dailyMs = NEWS_DAILY_HOURS * 60 * 60 * 1000;
-    const weeklyMs = NEWS_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
-
-    if (diffMs <= dailyMs) return "daily";
-    if (diffMs <= weeklyMs) return "weekly";
-    return null;
-}
-
-function computeImportanceScore(item, publishedAtMs, nowMs) {
-    let score = 0;
-
-    if (item.featured) score += 50;
-
-    const source = String(item.news_site || item.newsSite || "").toLowerCase();
-    if (source.includes("nasa")) score += 30;
-    if (source.includes("esa")) score += 22;
-    if (source.includes("spacex")) score += 22;
-    if (source.includes("space")) score += 8;
-
-    const title = String(item.title || "").toLowerCase();
-    const keywords = ["launch", "moon", "mars", "starship", "artemis", "rocket", "mission"];
-    for (const k of keywords) {
-        if (title.includes(k)) score += 6;
-    }
-
-    const weeklyMs = NEWS_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
-    const freshness = Math.max(0, Math.min(25, Math.round((1 - (nowMs - publishedAtMs) / weeklyMs) * 25)));
-    score += freshness;
-
-    return score;
-}
-
-async function fetchRecentSpaceNews() {
-    const res = await fetch("https://api.spaceflightnewsapi.net/v4/articles/?limit=120&ordering=-published_at");
-    if (!res.ok) {
-        throw new Error("No se pudieron descargar noticias espaciales.");
-    }
-
-    const data = await res.json();
-    const results = Array.isArray(data.results) ? data.results : [];
-    const now = Date.now();
-    const weeklyMs = NEWS_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
-    const minTs = now - weeklyMs;
-
-    const seen = new Set();
-    const selected = [];
-
-    for (const item of results) {
-        const url = item.url;
-        if (!url || seen.has(url)) continue;
-
-        const ts = toTime(item.published_at || item.publishedAt);
-        if (!ts || ts < minTs) continue;
-
-        const scope = getNewsScope(ts, now);
-        if (!scope) continue;
-
-        seen.add(url);
-        selected.push({ ...item, __ts: ts, __scope: scope });
-
-        if (selected.length >= NEWS_LIMIT) break;
-    }
-
-    const translated = [];
-    for (const item of selected) {
-        const titleEs = await translateEnToEs(item.title || "");
-        const summaryEs = await translateEnToEs(item.summary || "");
-
-        translated.push({
-            tipo_documento: "noticia",
-            news_id: String(item.id || item.url),
-            url: item.url,
-            title: titleEs || item.title || "",
-            summary: summaryEs || item.summary || "",
-            image_url: item.image_url || item.imageUrl || "",
-            source: item.news_site || item.newsSite || "Fuente externa",
-            published_at: toIsoDate(item.published_at || item.publishedAt),
-            scope: item.__scope,
-            score_importancia: computeImportanceScore(item, item.__ts, now),
-            updated_at: new Date().toISOString()
-        });
-    }
-
-    return translated;
-}
-
-async function syncNewsToMongo() {
-    const collection = await getCollection();
-    const news = await fetchRecentSpaceNews();
-
-    await collection.deleteMany({ tipo_documento: "noticia" });
-    if (news.length > 0) {
-        await collection.insertMany(news);
-    }
-
-    return {
-        total: news.length,
-        daily: news.filter((n) => n.scope === "daily").length,
-        weekly: news.filter((n) => n.scope === "weekly").length
-    };
-}
-
-// -------------------- RUTAS --------------------
-
 app.get("/api/sync", async (req, res) => {
     if (!isAuthorized(req)) {
         return res.status(401).json({ error: "No autorizado para sincronizar." });
@@ -381,6 +393,7 @@ app.get("/api/sync", async (req, res) => {
 
     try {
         const result = await syncMasterAndArchive();
+
         return res.json({
             mensaje: "Sincronizacion completada con exito",
             futuras_guardadas: result.futuras,
@@ -402,13 +415,34 @@ app.get("/api/import-past", async (req, res) => {
     }
 
     try {
+        const collection = await getCollection();
         const pages = Math.max(1, Number(req.query.pages || 5));
-        const imported = await importPastLaunches(pages, IMPORT_PAGE_SIZE);
+        const pageSize = Math.min(IMPORT_PAGE_SIZE, Math.max(10, Number(req.query.limit || IMPORT_PAGE_SIZE)));
+        const resetCursor = String(req.query.reset || "").toLowerCase() === "true";
+        const hasOffset = req.query.offset !== undefined;
+
+        if (resetCursor) {
+            await setHistoricImportCursor(collection, 0);
+        }
+
+        const startOffset = hasOffset
+            ? Math.max(0, Number(req.query.offset || 0))
+            : await getHistoricImportCursor(collection);
+
+        const imported = await importPastLaunchesFromOffset(collection, startOffset, pages, pageSize);
+        await setHistoricImportCursor(collection, imported.offsetSiguiente);
 
         return res.json({
             mensaje: "Historial importado correctamente",
-            paginas_procesadas: pages,
-            registros_importados: imported
+            paginas_procesadas: imported.paginasProcesadas,
+            registros_importados: imported.registrosImportados,
+            offset_inicial: startOffset,
+            offset_siguiente: imported.offsetSiguiente,
+            total_disponible_api: imported.totalDisponible,
+            quedan_mas: imported.quedanMas,
+            sugerencia: imported.quedanMas
+                ? "Vuelve a llamar /api/import-past para seguir importando mas historial."
+                : "Historial agotado: ya no quedan mas paginas por importar."
         });
     } catch (error) {
         console.error("Error en /api/import-past:", error);
@@ -419,12 +453,38 @@ app.get("/api/import-past", async (req, res) => {
     }
 });
 
+app.get("/api/import-past-status", async (req, res) => {
+    if (!isAuthorized(req)) {
+        return res.status(401).json({ error: "No autorizado para consultar estado de importacion." });
+    }
+
+    try {
+        const collection = await getCollection();
+        const offsetActual = await getHistoricImportCursor(collection);
+        const totalHistorico = await collection.countDocuments({ tipo_documento: "historico" });
+
+        return res.json({
+            offset_actual: offsetActual,
+            historico_guardado: totalHistorico,
+            ayuda: "Llama /api/import-past para seguir trayendo bloques historicos."
+        });
+    } catch (error) {
+        console.error("Error en /api/import-past-status:", error);
+        return res.status(500).json({
+            error: "Error consultando estado de importacion",
+            detalle: error.message
+        });
+    }
+});
+
 app.get("/api/misiones", async (req, res) => {
     try {
         const collection = await getCollection();
         const datos = await collection.findOne({ id_guardado: "historial_maestro" });
 
-        if (!datos) return res.json({ futuras: [], pasadas: [] });
+        if (!datos) {
+            return res.json({ futuras: [], pasadas: [] });
+        }
 
         return res.json({
             futuras: datos.futuras || [],
@@ -449,7 +509,12 @@ app.get("/api/historial", async (req, res) => {
 
         const [total, resultados] = await Promise.all([
             collection.countDocuments(query),
-            collection.find(query).sort({ net: -1 }).skip(skip).limit(limit).toArray()
+            collection
+                .find(query)
+                .sort({ net: -1 })
+                .skip(skip)
+                .limit(limit)
+                .toArray()
         ]);
 
         return res.json({
@@ -474,7 +539,9 @@ app.get("/api/buscar", async (req, res) => {
         const q = String(req.query.q || "").trim();
         const limit = Math.min(Number(req.query.limit || 20), HISTORY_PAGE_LIMIT_MAX);
 
-        if (!q) return res.json({ resultados: [] });
+        if (!q) {
+            return res.json({ resultados: [] });
+        }
 
         const regex = new RegExp(q, "i");
         const resultados = await collection
@@ -506,53 +573,116 @@ app.get("/api/estadisticas", async (req, res) => {
     try {
         const collection = await getCollection();
 
-        const docs = await collection
-            .find({ tipo_documento: "historico" })
-            .project({ net: 1, status: 1, launch_service_provider: 1 })
-            .toArray();
+        const yearsPipeline = [
+            { $match: { tipo_documento: "historico" } },
+            {
+                $addFields: {
+                    parsedNet: {
+                        $dateFromString: {
+                            dateString: "$net",
+                            onError: null,
+                            onNull: null
+                        }
+                    }
+                }
+            },
+            { $match: { parsedNet: { $ne: null } } },
+            { $group: { _id: { $year: "$parsedNet" } } },
+            { $sort: { _id: -1 } }
+        ];
 
-        const parsed = docs
-            .map((d) => {
-                const date = d?.net ? new Date(d.net) : null;
-                if (!date || Number.isNaN(date.getTime())) return null;
+        const yearsDocs = await collection.aggregate(yearsPipeline).toArray();
+        const years = yearsDocs.map((doc) => doc._id).filter((year) => Number.isFinite(year));
+        const latestYear = years.length > 0 ? years[0] : new Date().getFullYear();
+        const selectedYear = Number(req.query.year || latestYear);
 
-                return {
-                    year: date.getUTCFullYear(),
-                    month: date.getUTCMonth() + 1,
-                    agency: d?.launch_service_provider?.name || "Desconocida",
-                    statusName: String(d?.status?.name || "").toLowerCase()
-                };
-            })
-            .filter(Boolean);
+        const statsPipeline = [
+            { $match: { tipo_documento: "historico" } },
+            {
+                $addFields: {
+                    parsedNet: {
+                        $dateFromString: {
+                            dateString: "$net",
+                            onError: null,
+                            onNull: null
+                        }
+                    }
+                }
+            },
+            {
+                $match: {
+                    parsedNet: { $ne: null },
+                    $expr: { $eq: [{ $year: "$parsedNet" }, selectedYear] }
+                }
+            },
+            {
+                $facet: {
+                    monthly: [
+                        { $group: { _id: { $month: "$parsedNet" }, count: { $sum: 1 } } },
+                        { $sort: { _id: 1 } }
+                    ],
+                    agencies: [
+                        {
+                            $group: {
+                                _id: {
+                                    $ifNull: ["$launch_service_provider.name", "Desconocida"]
+                                },
+                                count: { $sum: 1 }
+                            }
+                        },
+                        { $sort: { count: -1 } },
+                        { $limit: 10 }
+                    ],
+                    statuses: [
+                        {
+                            $group: {
+                                _id: {
+                                    $toLower: {
+                                        $ifNull: ["$status.name", ""]
+                                    }
+                                },
+                                count: { $sum: 1 }
+                            }
+                        }
+                    ],
+                    totals: [{ $count: "total" }]
+                }
+            }
+        ];
 
-        const years = [...new Set(parsed.map((p) => p.year))].sort((a, b) => b - a);
-        const latestYear = years[0] || new Date().getUTCFullYear();
-        const selectedYear = Number(req.query.year) || latestYear;
+        const [statsDoc] = await collection.aggregate(statsPipeline).toArray();
+        const monthlyRaw = statsDoc?.monthly || [];
+        const agenciesRaw = statsDoc?.agencies || [];
+        const statusesRaw = statsDoc?.statuses || [];
+        const totalLaunches = statsDoc?.totals?.[0]?.total || 0;
 
-        const rows = parsed.filter((p) => p.year === selectedYear);
-
-        const totalLaunches = rows.length;
-        const successCount = rows.filter((r) => r.statusName.includes("success") || r.statusName.includes("exito")).length;
-        const failedCount = rows.filter((r) => r.statusName.includes("fail") || r.statusName.includes("fall")).length;
-
-        const monthCounts = Array.from({ length: 12 }, (_, i) => ({ month: i + 1, count: 0 }));
-        rows.forEach((r) => {
-            monthCounts[r.month - 1].count += 1;
+        const monthlyMap = new Map(monthlyRaw.map((item) => [item._id, item.count]));
+        const monthly = Array.from({ length: 12 }, (_, index) => {
+            const month = index + 1;
+            return {
+                month,
+                count: monthlyMap.get(month) || 0
+            };
         });
 
-        const agencyMap = new Map();
-        rows.forEach((r) => {
-            agencyMap.set(r.agency, (agencyMap.get(r.agency) || 0) + 1);
+        let successCount = 0;
+        let failedCount = 0;
+
+        statusesRaw.forEach((item) => {
+            const key = String(item._id || "");
+            const count = Number(item.count || 0);
+            if (key.includes("success") || key.includes("exito")) {
+                successCount += count;
+            } else if (key.includes("fail") || key.includes("fall")) {
+                failedCount += count;
+            }
         });
 
-        const byAgency = [...agencyMap.entries()]
-            .map(([name, count]) => ({
-                name,
-                count,
-                percent: totalLaunches > 0 ? Math.round((count / totalLaunches) * 100) : 0
-            }))
-            .sort((a, b) => b.count - a.count)
-            .slice(0, 10);
+        const byAgency = agenciesRaw.map((item) => ({
+            name: item._id || "Desconocida",
+            count: item.count,
+            percent: totalLaunches > 0 ? Math.round((item.count / totalLaunches) * 100) : 0
+        }));
 
         return res.json({
             year: selectedYear,
@@ -561,7 +691,7 @@ app.get("/api/estadisticas", async (req, res) => {
             success_count: successCount,
             failed_count: failedCount,
             by_agency: byAgency,
-            by_month: monthCounts
+            by_month: monthly
         });
     } catch (error) {
         console.error("Error en /api/estadisticas:", error);
@@ -578,12 +708,10 @@ app.get("/api/sync-news", async (req, res) => {
     }
 
     try {
-        const result = await syncNewsToMongo();
+        const total = await syncNewsToMongo();
         return res.json({
             mensaje: "Noticias sincronizadas correctamente",
-            noticias_guardadas: result.total,
-            diarias_guardadas: result.daily,
-            semanales_guardadas: result.weekly,
+            noticias_guardadas: total,
             ventana_dias: NEWS_LOOKBACK_DAYS
         });
     } catch (error) {
@@ -598,21 +726,13 @@ app.get("/api/sync-news", async (req, res) => {
 app.get("/api/noticias", async (req, res) => {
     try {
         const collection = await getCollection();
-        const scope = String(req.query.scope || "weekly").toLowerCase(); // daily | weekly | all
-        const query = { tipo_documento: "noticia" };
-
-        if (scope === "daily" || scope === "weekly") {
-            query.scope = scope;
-        }
-
         const resultados = await collection
-            .find(query)
-            .sort({ score_importancia: -1, published_at: -1 })
+            .find({ tipo_documento: "noticia" })
+            .sort({ published_at: -1 })
             .limit(NEWS_LIMIT)
             .toArray();
 
         return res.json({
-            scope,
             resultados,
             total: resultados.length
         });
