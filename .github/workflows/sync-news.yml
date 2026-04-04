@@ -1,10 +1,10 @@
 name: Sync Noticias Novastra
 
 on:
-  schedule:
-    - cron: "30 3 * * *" # Diario
-    - cron: "0 4 * * 0"  # Semanal extra (domingo)
   workflow_dispatch:
+  schedule:
+    - cron: "30 3 * * *"
+    - cron: "0 4 * * 0"
 
 jobs:
   sync-news:
